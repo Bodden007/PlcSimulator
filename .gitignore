@@ -1,0 +1,19 @@
+# .NET / C#
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.cache
+*.log
+
+# Rust
+target/
+*.rs.bk
+Cargo.lock
+
+# IDE и ОС
+.vs/
+.idea/
+*.sln
+.DS_Store
+Thumbs.db
