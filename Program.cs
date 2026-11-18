@@ -9,7 +9,7 @@ namespace CoreLink.PlcSimulator;
 internal static class Program
 {
     private const int Port = 1502;
-    private const byte UnitId = 1;
+    private const byte UnitId = 255;
 
     private const int OnlineSeconds = 10;
     private const int OfflineSeconds = 10;
@@ -45,8 +45,8 @@ internal static class Program
         Log("Input values: random every 1 second; F = fixed test values");
         Log("Supported: FC03 / FC04 / FC06 / FC16");
         Log("M = map | V = verbose | H = hang FC03/FC04 | F = fixed/random | Q = quit");
-        Log("0..9 = Measurme | 0 = NONE | 1 = UA | 2 = EU");
-        Log("Measurme initially 1 (UA), changed only by keyboard");
+        Log("0..9 = Measurme | 0 = NONE | 1 = US | 2 = METRIC");
+        Log("Measurme initially 1 (US), changed only by keyboard");
 
         Task? autoTask = null;
 
@@ -320,21 +320,22 @@ internal sealed class PlcServer : IAsyncDisposable
 
     // Input Registers (FC04) и Holding Registers (FC03/06/16)
     // — независимые области Modbus.
-    private readonly ushort[] _registers = new ushort[17];
-    // 0..16 — технологическая карта; 20..23 — отдельные тестовые регистры.
+    private readonly ushort[] _registers = new ushort[44];
+    // Holding: 0..23, адреса 20..23 — отдельные тестовые регистры.
     private readonly ushort[] _holdingRegisters = new ushort[24];
 
     private static readonly RegisterInfo[] RegisterMap =
     [
-        new("Measurme", 0, RegisterKind.Word),
-        new("Status", 1, RegisterKind.Word),
-        new("Cutoff", 3, RegisterKind.Word),
-        new("Speed", 5, RegisterKind.Float),
-        new("Pressure_1", 7, RegisterKind.Float),
-        new("Pressure_2", 9, RegisterKind.Float),
-        new("Pressure_3", 11, RegisterKind.Float),
-        new("Pressure_4", 13, RegisterKind.Float),
-        new("Pressure_5", 15, RegisterKind.Float)
+        new("Measurme", 1, RegisterKind.Word),
+        new("Pressure_1", 8, RegisterKind.Float),
+        new("Opko_1", 12, RegisterKind.Float),
+        new("StatOpko_1", 14, RegisterKind.Word),
+        new("TemperatureOutlet", 20, RegisterKind.Float),
+        new("TemperatureVaporizer", 22, RegisterKind.Float),
+        new("TemperatureBath", 24, RegisterKind.Float),
+        new("PUMP_1RPM", 30, RegisterKind.Float),
+        new("PUMP_1SCFStage", 34, RegisterKind.Float),
+        new("PUMP_1TotalSCFM", 42, RegisterKind.Float)
     ];
 
     private readonly ConcurrentDictionary<int, TcpClient>
@@ -369,7 +370,7 @@ internal sealed class PlcServer : IAsyncDisposable
 
         // Состояние устройства, а не случайный сигнал.
         // Сохраняется при Stop/Start в режиме --cycle.
-        _registers[0] = 1;
+        _registers[1] = 1;
 
         // Контрольный Holding-блок для FC03/06/16.
         // Порядок Float: младшее WORD, затем старшее.
@@ -483,8 +484,9 @@ internal sealed class PlcServer : IAsyncDisposable
 
         lock (_registerLock)
         {
-            previous = _registers[0];
-            _registers[0] = value;
+            previous = _registers[1];
+            _registers[1] = value;
+            GenerateRegistersLocked();
         }
 
         if (previous == value)
@@ -496,8 +498,8 @@ internal sealed class PlcServer : IAsyncDisposable
         string description = value switch
         {
             0 => "NONE",
-            1 => "UA",
-            2 => "EU",
+            1 => "US",
+            2 => "METRIC",
             _ => "UNREGISTERED / TEST"
         };
 
@@ -566,7 +568,7 @@ internal sealed class PlcServer : IAsyncDisposable
         }
 
         Program.Log(fixedMode
-            ? "INPUT FIXED: Status=1, Cutoff=0, Speed=1234.5, P1=12.5, P2=25.25, P3=50.5, P4=100.75, P5=200.125"
+            ? "INPUT FIXED: P1=1500 psi / 103.42 bar, OPKO=1800 psi / 124.11 bar, RPM=1200"
             : "INPUT RANDOM: values update every second");
     }
 
@@ -577,17 +579,17 @@ internal sealed class PlcServer : IAsyncDisposable
     {
         lock (_registerLock)
         {
-            float speed = ReadFloat(5);
-            float pressure = ReadFloat(7);
+            float pressure = ReadFloat(8);
+            float opko = ReadFloat(12);
+            float rpm = ReadFloat(30);
 
             return
                 $"Gen={_generation} " +
                 $"Mode={(_fixedValues == 1 ? "FIXED" : "RANDOM")} " +
-                $"Measurme={_registers[0]} " +
-                $"Status={_registers[1]} " +
-                $"Cutoff={_registers[3]} " +
-                $"Speed={speed:F1} " +
-                $"P1={pressure:F1}";
+                $"Measurme={_registers[1]} " +
+                $"P1={pressure:F1} " +
+                $"OPKO={opko:F1} " +
+                $"RPM={rpm:F1}";
         }
     }
 
@@ -1142,28 +1144,34 @@ internal sealed class PlcServer : IAsyncDisposable
 
     private void GenerateRegistersLocked()
     {
-        // Measurme управляется только клавиатурой.
-        if (_fixedValues == 1)
-        {
-            _registers[1] = 1;
-            _registers[3] = 0;
-            WriteFloat(_registers, 5, 1234.5f);
-            WriteFloat(_registers, 7, 12.5f);
-            WriteFloat(_registers, 9, 25.25f);
-            WriteFloat(_registers, 11, 50.5f);
-            WriteFloat(_registers, 13, 100.75f);
-            WriteFloat(_registers, 15, 200.125f);
-        }
-        else
-        {
-            _registers[1] = (ushort)Random.Shared.Next(0, 2);
-            _registers[3] = (ushort)Random.Shared.Next(0, 2);
-            WriteFloat(_registers, 5, Random.Shared.NextSingle() * 3000f);
+        // Measurme (адрес 1) изменяется только с клавиатуры.
+        // Для проверки UI: готовые значения в системе 1 или 2.
+        // Симулятор не задаёт физические коэффициенты SCF -> нм³.
+        bool metric = _registers[1] == 2;
 
-            for (int address = 7; address <= 15; address += 2)
-                WriteFloat(_registers, address,
-                    Random.Shared.NextSingle() * 250f);
+        float pressure = _fixedValues == 1 ? 1500f : 1300f + Random.Shared.NextSingle() * 400f;
+        float opko = 1800f;
+
+        if (metric)
+        {
+            pressure = _fixedValues == 1 ? 103.42f : pressure * 0.0689476f;
+            opko = 124.11f;
         }
+
+        WriteFloat(_registers, 8, pressure);
+        WriteFloat(_registers, 12, opko);
+        _registers[14] = (ushort)(_fixedValues == 1 ? 0 : Random.Shared.Next(0, 2));
+
+        WriteFloat(_registers, 20, _fixedValues == 1 ? 96f : 85f + Random.Shared.NextSingle() * 20f);
+        WriteFloat(_registers, 22, _fixedValues == 1 ? 85f : 75f + Random.Shared.NextSingle() * 20f);
+        WriteFloat(_registers, 24, _fixedValues == 1 ? 75f : 65f + Random.Shared.NextSingle() * 20f);
+        WriteFloat(_registers, 30, _fixedValues == 1 ? 1200f : Random.Shared.NextSingle() * 2000f);
+        WriteFloat(_registers, 34, metric
+            ? (_fixedValues == 1 ? 100f : Random.Shared.NextSingle() * 200f)
+            : (_fixedValues == 1 ? 3500f : Random.Shared.NextSingle() * 7000f));
+        WriteFloat(_registers, 42, metric
+            ? (_fixedValues == 1 ? 40f : Random.Shared.NextSingle() * 100f)
+            : (_fixedValues == 1 ? 1500f : Random.Shared.NextSingle() * 3500f));
 
         _generation++;
     }
